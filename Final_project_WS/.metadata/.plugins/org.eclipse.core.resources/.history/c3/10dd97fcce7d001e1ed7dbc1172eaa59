@@ -1,0 +1,336 @@
+/*
+ * Control_ECU_main.c
+ *
+ *  Created on: Oct 27, 2023
+ *      Author: Mark
+ */
+#include "buzzer.h"
+#include <util/delay.h>
+#include "uart.h"
+#include "external_eeprom.h"
+#include "twi.h"
+#include "motor.h"
+#include "timer1.h"
+#include <avr/io.h>
+
+
+
+/*************************************************************************
+ *                            DEFINITIONS                                *
+ *************************************************************************/
+
+#define PASS_SIZE 5 /*Size of the array to hold password*/
+
+#define PASS_EXIST_ADDRESS 1 /*the address of the eeprom at which we store the PASS_EXiST
+							byte to know if there is a pss stored on the system or not*/
+
+/*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~*/
+
+/*Next definitions are commands used to communicate using uart*/
+
+#define READY 0x0F/*sent by the receiving ECU to tell the sending ECU that it is ready to receive a new command*/
+#define PASS_EXIST 0xF7/*Byte sent for checking if a Password is saved in the control system*/
+#define SEND_PASS 0x11/*command for sending the new password*/
+#define PASS_CONFIRM 0x22/*command for confirming that the two passwords sent matches*/
+#define SEND_CURRENT_PASS 0x33/*command for sending the current password that is currently saved*/
+#define CHECK_CURRENT_PASS 0X44/*command for checking if the password sent matches the one saved on the system*/
+#define OPEN_DOOR 0X55/*Command for opening the door */
+#define CHANGE_PASS 0X066/*command to change the current password*/
+#define ALARM_ON 0x77/*command to turn on the alarm*/
+
+
+
+
+
+/*************************************************************************
+ *                            GLOBAL VARIABLES                           *
+ *************************************************************************/
+
+char g_pass[5]={0};/*Array to store the password */
+char g_passConfirm[5]={0};/*Array to store the password confirmation*/
+int g_passAddresses[5]={133,1056,2001,7,560};/*array of random scattered addresses to store the password at*/
+
+/*
+ * these two variables used for the timer to use the timer as a delay for displaying msgs
+ * timerflag: flag is set when the timer counts the delay desired.
+ * timercount: variable that holds the value of the delay desired in seconds.
+ */
+char g_timerFlag=0;
+char g_timercount=0;
+
+/*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~*/
+
+
+/*************************************************************************
+ *                         FUNCTIONS DEFINITIONS                         *
+ *************************************************************************/
+
+
+/*
+ * Timer delay function used as a call back function for the timer
+ * to be used as a delay in seconds .
+ */
+void timer_delay(void){
+	static uint8 count=0; /*static variable to count the number of interrupts which occur every second*/
+	count++; /*increment the count every interrupt(second)*/
+
+	/*if the count reaches the timercount stop the timer and
+	 * reset the count and set the flag*/
+	/*flag is then reset manually when using this function*/
+	if(count==g_timercount){
+		Timer1_deInit();
+		count=0;
+		g_timercount=0;
+		g_timerFlag=1;
+	}
+
+}
+
+/*
+ * this function is responsible to delete the current password
+ * it removes the PASS_CONFIRM byte and replaces it by 0 so the system
+ * indicates that no password is saved.
+ */
+void deletePass(){
+	EEPROM_writeByte(PASS_EXIST_ADDRESS,0);
+	_delay_ms(10);
+}
+
+
+
+/*
+ * Timer call back function to open the door
+ * this function is responsible to stop the door for 3 seconds after 15 seconds of opening.
+ * then start locking it again for 15 seconds .
+ * then stop the motor.
+ */
+void openDoor(){
+	static char count =0;
+	count++;
+	if(count==15){
+		/*stop the motor after 15 seconds*/
+		DcMotor_Rotate(MOTOR_STOP,0);
+	}
+	else if(count==18){
+		/*after 3 seconds from stopping the motor start rotating in the opposite direction*/
+		DcMotor_Rotate(MOTOR_ANTICLOCKWISE,100);
+
+	}
+	else if(count==33){
+		/*after 15 more seconds of locking stop the motor*/
+		DcMotor_Rotate(MOTOR_STOP,0);
+		count=0;
+		Timer1_deInit();/*deinitialize the timer to stop the interrupts*/
+	}
+
+}
+
+
+/*
+ * This function is responsible for checking if a password is currently stored on the system.
+ * If there is a password store it in the g_pass array and return PASS_EXIST confirmation.
+ * else :return 0.
+ */
+uint8 passExists(void){
+	/*readt the byte stored in the pass exist address location*/
+	uint8 data;
+	EEPROM_readByte(PASS_EXIST_ADDRESS,&data);
+	/*if the PASS_EXIST byte is stored then there is a password located on the system
+	 * store this pass in the g_pass array*/
+	if(data==PASS_EXIST){
+		for(char i=0;i<PASS_SIZE;i++){
+			EEPROM_readByte(g_passAddresses[(int)i],&g_pass[(int)i]);
+		}
+		return PASS_EXIST;
+	}
+	else
+		return 0;
+}
+
+
+/*
+ * This function is responsible to receive the new password sent by the user
+ * and it's confirmation and store them in the g_pass and g_passconfirm arrays.
+ */
+void recievePass(){
+	for(char i=0;i<PASS_SIZE;i++){
+		g_pass[(int)i]=UART_recieveByte();/*receive the pass*/
+	}
+	//	UART_sendByte(READY);
+	for(char i=0;i<PASS_SIZE;i++){
+		g_passConfirm[(int)i]=UART_recieveByte();/*receive the pass confirmation*/
+	}
+}
+
+
+
+/*
+ * This function is responsible for comparing the pass with the pass confirm
+ * and reply if they match or not.
+ */
+uint8 passConfirmMatch(){
+	/*send ready for the HMI ECU*/
+	UART_sendByte(READY);
+
+	uint8 flag=0;
+	/*compare the pass with the pass confirm */
+	for(char i=0;i<PASS_SIZE;i++){
+		/*if one number is unmatched stop comparing and set the flag to 1 */
+		if(g_pass[(int)i]!=g_passConfirm[(int)i]){
+			flag=1;
+			break;
+		}
+	}
+	if(flag==0){
+		/*if the passwords match send PASS_CONFIRM to the HMI ECU*/
+		UART_sendByte(PASS_CONFIRM);
+		return PASS_CONFIRM;
+	}
+	else{
+		/*if the don't match send 0*/
+		UART_sendByte(0);
+		return 0;
+	}
+}
+
+
+/*
+ * This function is responsible to store the new pass by writing the pass received in
+ * the specified locations in the eeprom.
+ */
+void storePass(){
+	/*store the pass in the external EEPROM*/
+	for(char i=0;i<PASS_SIZE;i++){
+		EEPROM_writeByte(g_passAddresses[(int)i],g_pass[(int)i]);
+		_delay_ms(10);
+	}
+	/*Store the PASS_EXIST byte in it's specified address to indicate that a password has been stored*/
+	EEPROM_writeByte(PASS_EXIST_ADDRESS,PASS_EXIST);
+	_delay_ms(10);
+}
+
+
+/*
+ * This function is responsible for receiving the current pass from the HMI ECU to
+ * compare it with the stored pass
+ */
+void recieveCurrentPass(){
+	/* receive pass and store it in the pass confirm array*/
+	for(char i=0;i<PASS_SIZE;i++){
+		g_passConfirm[(int)i]=UART_recieveByte();
+	}
+
+}
+
+
+
+/*
+ * This function is responsible for comparing the received pass with currently
+ * stored password .
+ */
+uint8 currentPassConfirm(){
+	/*compare the received pass with the stored pass */
+	uint8 flag=0;
+	for(char i=0;i<PASS_SIZE;i++){
+		if(g_passConfirm[(int)i]!=g_pass[(int)i]){
+			/*if there is a mismatch set the flag to one and stop comparing*/
+			flag=1;
+			break;
+		}
+	}
+	if(flag==0)
+		return PASS_CONFIRM;/*if passwords match return PASS_CONFIRM*/
+	else
+		return 0; /*else return 0*/
+}
+
+
+
+
+/*************************************************************************
+ *                            MAIN FUNCTION                              *
+ *************************************************************************/
+
+int main(void){
+	/*
+	 * Initialize uart with :
+	 * 1- 8 bit data.
+	 * 2- no parity.
+	 * 3- 1 stop bit.
+	 * 4- baud rate 9600.
+	 */
+	UART_ConfigType uart_config={UART_8BIT,PARITY_DISABLE,UART_1_STOP_BIT,9600};
+
+	/*
+	 * Initialize TWI with:
+	 * 1- slave address 10.
+	 * 2- baud rate 400kbps.
+	 */
+	TWI_ConfigType twi_config={10,FAST_MODE_400kbps};
+	/*initialize timer :
+	 * 1- initial value =0
+	 * 2- compare value = 31250
+	 * 3- 256 prescaler
+	 * 4- CTC mode
+	 */
+	Timer1_ConfigType timer_config={0,31250,CLK_256,CTC_OCR1A};
+
+	UART_init(&uart_config);
+	TWI_init(&twi_config);
+	DcMotor_init();/*Initialize Motor*/
+	Buzzer_Init();/*initialize buzzer*/
+	uint8 uartData;
+	SREG|=(1<<7);/*enable global interrupts*/
+	_delay_ms(100);
+	while(1){
+		/*the control ECU sends Ready whenever it's ready to receive a new command*/
+		UART_sendByte(READY);
+		/*receive a new command */
+		uartData=UART_recieveByte();
+
+		/*if the received command is PASS_EXIST :
+		 * check if there is a pass stored and reply with the result*/
+		if(uartData==PASS_EXIST){
+			UART_sendByte(passExists());
+		}
+		/*if it receives a command to receive a new pass*/
+		else if(uartData==SEND_PASS){
+			recievePass();/*receive the new pass*/
+			if(passConfirmMatch()==PASS_CONFIRM){/*check if the pass and it's confirmation matches*/
+				storePass(); /*store the pass if matches*/
+			}
+		}
+		/*if the command is to receive the current pass*/
+		else if(uartData==SEND_CURRENT_PASS){
+			recieveCurrentPass(); /*receive the current pass to be compared with the stored pass*/
+		}
+		/*if the command is to check the send pass with the stored one */
+		else if(uartData==CHECK_CURRENT_PASS){
+			/*compare the received pass with the stored pass and reply to the HMI with the result*/
+			UART_sendByte(currentPassConfirm());
+		}
+		/*if the received command is to open the door*/
+		else if(uartData==OPEN_DOOR){
+			/*start rotating the motor clockwise*/
+			DcMotor_Rotate(MOTOR_CLOCKWISE,100);
+			Timer1_setCallBack(openDoor);/*set the timer call back function to the open door function*/
+			Timer1_init(&timer_config);
+		}
+		/*if the received command to change the pass*/
+		else if(uartData==CHANGE_PASS){
+			deletePass(); /*delete current pass*/
+		}
+		/*if the received command to activate the alarm */
+		else if(uartData==ALARM_ON){
+			Buzzer_on(); /*activate buzzer*/
+			/*set delay for 60 seconds*/
+			g_timercount=60;
+			Timer1_setCallBack(timer_delay);/*set timer call back function to timer_delay function*/
+			Timer1_init(&timer_config);
+			while(g_timerFlag!=1);/*wait for timer to finish counting*/
+			g_timerFlag=0;
+			Buzzer_off();
+		}
+	}
+}
+

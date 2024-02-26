@@ -1,0 +1,100 @@
+/*
+ * Control_ECU_main.c
+ *
+ *  Created on: Oct 27, 2023
+ *      Author: Mark
+ */
+#include "buzzer.h"
+#include <util/delay.h>
+#include "uart.h"
+#include "external_eeprom.h"
+#include "my_lcd.h"
+#include "twi.h"
+#define PASS_SIZE 5
+#define READY 0x0F
+#define PASS_EXIST 0xF7
+#define SEND_PASS 0x11
+#define PASS_CONFIRM 0x22
+#define SEND_CURRENT_PASS 0x33
+#define PASS_EXIST_ADDRESS 1
+
+char g_pass[5]={0};
+char g_passConfirm[5]={0};
+int g_passAddresses[5]={133,1056,2001,7,560};
+uint8 passExists(void){
+	uint8 data;
+	EEPROM_readByte(PASS_EXIST_ADDRESS,&data);
+	if(data==PASS_EXIST)
+		return PASS_EXIST;
+	else
+		return 0;
+}
+void recievePass(){
+	for(char i=0;i<PASS_SIZE;i++){
+		g_pass[i]=UART_recieveByte();
+		//		LCD_integerToString(g_pass[i]);
+	}
+	//	UART_sendByte(READY);
+	for(char i=0;i<PASS_SIZE;i++){
+		g_passConfirm[i]=UART_recieveByte();
+		//		LCD_integerToString(g_pass[i]);
+	}
+}
+uint8 passConfirmMatch(){
+	UART_sendByte(READY);
+
+	uint8 flag=0;
+	for(char i=0;i<PASS_SIZE;i++){
+		if(g_pass[i]!=g_passConfirm[i]){
+			flag=1;
+			break;
+		}
+	}
+	if(flag==0){
+		//		UART_sendByte(READY);
+		UART_sendByte(PASS_CONFIRM);
+		return PASS_CONFIRM;
+	}
+	else{
+		//		UART_sendByte(READY);
+		UART_sendByte(0);
+		return 0;
+	}
+}
+void storePass(){
+	for(char i=0;i<PASS_SIZE;i++){
+		EEPROM_writeByte(g_passAddresses[i],g_pass[i]);
+		_delay_ms(10);
+	}
+	EEPROM_writeByte(PASS_EXIST_ADDRESS,PASS_EXIST);
+	_delay_ms(10);
+//	LCD_displayString("pass stored");
+//	uint8 data='c';
+//	EEPROM_readByte(PASS_EXIST_ADDRESS,&data);
+//	LCD_displayChar(data);
+}
+int main(void){
+	UART_ConfigType uart_config={UART_8BIT,PARITY_DISABLE,UART_1_STOP_BIT,9600};
+	TWI_ConfigType twi_config={10,FAST_MODE_400kbps};
+	UART_init(&uart_config);
+	TWI_init(&twi_config);
+	LCD_init();
+	uint8 uartData;
+	while(1){
+		UART_sendByte(READY);
+		//		LCD_displayString("ready");
+		uartData=UART_recieveByte();
+		//		LCD_displayString("byte received");
+		if(uartData==PASS_EXIST){
+			UART_sendByte(passExists());
+		}
+		else if(uartData==SEND_PASS){
+			recievePass();
+			if(passConfirmMatch()==PASS_CONFIRM){
+				storePass();
+			}
+		}
+
+	}
+}
+

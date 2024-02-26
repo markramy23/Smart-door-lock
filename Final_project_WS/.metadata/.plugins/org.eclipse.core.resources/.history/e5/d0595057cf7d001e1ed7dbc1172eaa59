@@ -1,0 +1,418 @@
+/*
+ * HMI_ECU_main.c
+ *
+ *  Created on: Oct 27, 2023
+ *      Author: Mark
+ */
+
+#include "my_keypad.h"
+#include "my_lcd.h"
+#include <util/delay.h>
+#include "timer1.h"
+#include "avr/io.h"
+#include "uart.h"
+
+/*************************************************************************
+ *                            DEFINITIONS                                *
+ *************************************************************************/
+
+#define PASS_SIZE 5 /*Size of the array to hold password*/
+
+/*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~*/
+
+/*Next definitions are commands used to communicate using uart*/
+
+#define READY 0x0F /*sent by the receiving ECU to tell the sending ECU that it is ready to receive a new command*/
+#define PASS_EXIST 0xF7 /*Byte sent for checking if a Password is saved in the control system*/
+#define SEND_PASS 0x11 /*command for sending the new password*/
+#define PASS_CONFIRM 0x22/*command for confirming that the two passwords sent matches*/
+#define SEND_CURRENT_PASS 0x33 /*command for sending the current password that is currently saved*/
+#define CHECK_CURRENT_PASS 0X44 /*command for checking if the password sent matches the one saved on the system*/
+#define OPEN_DOOR 0X55 /*Command for opening the door */
+#define CHANGE_PASS 0X066 /*command to change the current password*/
+#define ALARM_ON 0x77 /*command to turn on the alarm*/
+
+
+/*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~*/
+
+/*
+ * Function like macro to send a command for the control ECU to open the door.
+ * it waits for the control ECU to be ready then send the open door command
+ * used as macro to reduce function call overhead for proteus.
+ */
+#define openDoor(){\
+		while(UART_recieveByte()!=READY);\
+		UART_sendByte(OPEN_DOOR);\
+}
+/*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~*/
+
+
+/*************************************************************************
+ *                            GLOBAL VARIABLES                           *
+ *************************************************************************/
+
+char g_pass[5]={0}; /*Array to store the password */
+char g_passConfirm[5]={0}; /*Array to store the password confirmation*/
+
+/*
+ * these two variables used for the timer to use the timer as a delay for displaying msgs
+ * timerflag: flag is set when the timer counts the delay desired.
+ * timercount: variable that holds the value of the delay desired in seconds.
+ */
+char g_timerFlag=0;
+char g_timercount=0;
+
+/*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~*/
+
+
+/*************************************************************************
+ *                         FUNCTIONS DEFINITIONS                         *
+ *************************************************************************/
+
+
+/*
+ * Timer delay function used as a call back function for the timer
+ * to be used as a delay in seconds .
+ */
+void timer_delay(void){
+	static uint8 count=0; /*static variable to count the number of interrupts which occur every second*/
+	count++; /*increment the count every interrupt(second)*/
+
+	/*if the count reaches the timercount stop the timer and
+	 * reset the count and set the flag*/
+	/*flag is then reset manually when using this function*/
+	if(count==g_timercount){
+		Timer1_deInit();
+		count=0;
+		g_timercount=0;
+		g_timerFlag=1;
+	}
+
+}
+
+/*
+ * Function for entering new password that will be called the first time we use the system
+ * or when changing the password.
+ */
+void enter_new_pass(){
+	/*display the msg to enter the password*/
+	LCD_clearScreen();
+	LCD_displayString("Plz enter pass:  ");
+	LCD_moveCursor(1,0);
+	char i=0;
+	/*take the password as input from the keypad and store it in the pass array
+	 * and display '*' with each keypress*/
+	for(i=0;i<PASS_SIZE;i++){
+		g_pass[(int)i]=KEYPAD_getPressedKey();
+		_delay_ms(400); /*large delay is for proteus to not enter many characters with each press*/
+		LCD_displayChar('*');
+	}
+	while(KEYPAD_getPressedKey()!=13); /*wait until the user presses the enter key (green button in proteus keypad)*/
+	_delay_ms(400);
+
+	/*display the msg to enter the password confirmation*/
+	LCD_clearScreen();
+	LCD_displayString("Plz re-enter the");
+	LCD_moveCursor(1,0);
+	LCD_displayString("same pass: ");
+	/*do the same process again but this time store the input in Passconfirm array*/
+	for(i=0;i<PASS_SIZE;i++){
+		g_passConfirm[(int)i]=KEYPAD_getPressedKey();
+		_delay_ms(400);
+		LCD_displayChar('*');
+	}
+	while(KEYPAD_getPressedKey()!=13);
+	LCD_clearScreen();
+}
+
+
+
+/*
+ * Function to send the new password and it's confirmation to the control ecu through uart.
+ */
+
+void sendPass(){
+	/*wait for the control ecu to be ready*/
+	while(UART_recieveByte()!=READY);
+	/*send the command for sending password*/
+	UART_sendByte(SEND_PASS);
+	/*start sending the password stored in the pass array*/
+	for(char i=0;i<PASS_SIZE;i++){
+		UART_sendByte(g_pass[(int)i]);
+	}
+	/*then send the confirmation stored in the passconfirm array*/
+	for(char i=0;i<PASS_SIZE;i++){
+		UART_sendByte(g_passConfirm[(int)i]);
+	}
+
+}
+
+
+/*
+ * This function is called in starting the system to check if there is a password stored
+ * in the control ecu or not to decide what to do next.
+ */
+
+uint8 checkIfPassExist(){
+	/*wait for the control ECU to be ready*/
+	while(UART_recieveByte()!=READY);
+	/*send the command to check if a password exists or not*/
+	UART_sendByte(PASS_EXIST);
+	/*if the control ECU replys with the same command return PASSEXIST*/
+	if(UART_recieveByte()==PASS_EXIST)
+		return PASS_EXIST;
+	/*else return 0*/
+	else
+		return 0;
+}
+
+
+/*
+ * this function is used to check if the pass and the confirmation pass matches or not.
+ */
+uint8 passConfirm(){
+	/*wait for control ECU to be ready*/
+	while(UART_recieveByte()!=READY);
+	/*receive the confirmation command*/
+	uint8 confirmation=UART_recieveByte();
+	/*if the control ECU sends the confirmation command return with the confirmation command*/
+	if(confirmation==PASS_CONFIRM)
+		return PASS_CONFIRM;
+	/*else return 0*/
+	else
+		return 0;
+}
+
+
+/*
+ * this function is used to call the enter new password function to enter the new password
+ * then calls the sendPass function to send the password to control ECu
+ * and wait for it's response if the two passwords matches or not.
+ */
+
+void enterNewPassWithConfirm(){
+	uint8 flag=0;/*flag used for loop to keep entering the two passwords if they don't match*/
+	while(flag==0){
+		enter_new_pass(); /*enter the new password and it's confirmation*/
+		sendPass();/*send the new Password and it's confirmation to the control ECU*/
+
+		/*if the two password matches display pass match msg and set the flag to return from function*/
+		if(passConfirm()==PASS_CONFIRM){
+			flag=1;
+			LCD_displayString("pass match");
+			_delay_ms(500);
+		}
+		/*if the don't match display pass don't match and try again */
+		else{
+			LCD_displayString("pass don't match");
+			_delay_ms(500);
+		}
+	}
+}
+
+
+
+/*
+ * the function is used to take the current stored password as input from the user.
+ */
+void enterCurrentPass(){
+	LCD_clearScreen();
+	LCD_displayString("Plz enter Pass: ");
+	LCD_moveCursor(1,0);
+
+	/*
+	 * enter the password from the keypad and store it in the pass array
+	 * then wait for the user to press enter.
+	 */
+	for(char i=0;i<PASS_SIZE;i++){
+		g_pass[(int)i]=KEYPAD_getPressedKey();
+		_delay_ms(400);
+		LCD_displayChar('*');
+	}
+	while(KEYPAD_getPressedKey()!=13);
+}
+
+
+/*
+ * this is used to send the current stored password to the control ECU to check it
+ */
+void sendCurrentPass(){
+	while(UART_recieveByte()!=READY);
+	UART_sendByte(SEND_CURRENT_PASS);
+	for(char i=0;i<PASS_SIZE;i++){
+		UART_sendByte(g_pass[(int)i]);
+	}
+}
+
+/*
+ * this function checks if the password sent matches the stored one or not
+ * if it matches it returns PASS_CONFIRM.
+ * it it doesn't match it returns 0.
+ */
+uint8 checkCurrentPass(){
+	while(UART_recieveByte()!=READY);/*wait for the control ECU to be ready*/
+	UART_sendByte(CHECK_CURRENT_PASS); /*send the command to check if password match or not*/
+	uint8 data;
+	data=UART_recieveByte(); /*receive the reply of the control ecu */
+
+	/*return the result of the check*/
+	if(data==PASS_CONFIRM)
+		return PASS_CONFIRM;
+	else
+		return 0;
+}
+/*
+ * This function is responsible for the main functionality of the system after storing
+ * a new password is done.
+ * This the first function that gets called when running the program after storing a password
+ * successfully.
+ */
+void displayMainOption(){
+	uint8 key;/*variable to store the pressed key on keypad*/
+	uint8 wrongPassCount=0;/*variable to count the number of wrong pass entry times*/
+	uint8 WrongPassFlag=0;/*flag for reentering the pass after wrong entry*/
+	/*
+	 * First we Display on LCD:
+	 * +: Open Door
+	 * -: Change Pass
+	 */
+	LCD_clearScreen();
+	LCD_displayString("+ : Open Door");
+	LCD_moveCursor(1,0);
+	LCD_displayString("- : Change Pass");
+	key=KEYPAD_getPressedKey();
+
+	/*timer initialized to produce interrupt every 1 sec to be used as a delay*/
+	Timer1_ConfigType timer_config={0,31250,CLK_256,CTC_OCR1A};
+
+	_delay_ms(400); /*delay for proteus */
+	switch(key){
+	case '+':
+		while(WrongPassFlag==0){
+			_delay_ms(300);
+			enterCurrentPass();	/*when the user presses the '+' button it should ask him to enter the current password*/
+			sendCurrentPass();/*send the entered pass to the control ecu to check it*/
+			if(checkCurrentPass()==PASS_CONFIRM){
+				/*if the password is correct set the worgpassflag to 1 and start the unlocking process*/
+				WrongPassFlag=1;
+				/*send commant to open door*/
+				openDoor();
+				/*
+				 * display on lcd :
+				 * 1- door is unlocking for 18 seconds .
+				 * 2- door is locking for 15 seconds .
+				 */
+				LCD_clearScreen();
+				LCD_displayString("Door is");
+				LCD_moveCursor(1,0);
+				LCD_displayString("Unlocking");
+				/*use the timer to produce delay with seconds */
+				g_timercount=18;
+				Timer1_setCallBack(timer_delay);/*set timer call back function */
+				Timer1_init(&timer_config);/*set timer initialization*/
+				while(g_timerFlag!=1);/*wait for the timer to count till the desired number of seconds */
+				g_timerFlag=0; /*reset the flag to be able to reuse the delay function*/
+				LCD_clearScreen();
+				/*display door is locking for 15 seconds using the same process*/
+				LCD_displayString("Door is Locking");
+				g_timercount=15;
+				Timer1_setCallBack(timer_delay);
+				Timer1_init(&timer_config);
+				while(g_timerFlag!=1);
+				g_timerFlag=0;
+				LCD_clearScreen();
+			}
+			else{
+				/*if the pass did not match increment the wrongpasscount and enter pass again*/
+
+				wrongPassCount++;
+				/*if the user enter wrong password 3 consecutive times
+				 * activate the alarm and display error msg for 1 minute*/
+				if(wrongPassCount==3){
+					/*set the flag to one to stop looping on reentering the password */
+					WrongPassFlag=1;
+					/*send the command to activate the alarm for 1 minute  */
+					while(UART_recieveByte()!=READY);
+					UART_sendByte(ALARM_ON);
+					LCD_clearScreen();
+					LCD_displayString("SYSTEM LOCKED!!!");
+					g_timercount=60;
+					Timer1_setCallBack(timer_delay);
+					Timer1_init(&timer_config);
+					while(g_timerFlag!=1);
+					g_timerFlag=0;
+				}
+
+			}
+		}
+		break;
+	case '-':
+		/*If the user chooses to change password:
+		 * first : ask for the current pass.
+		 * second: if the password match send command to change password
+		 * if the pass doesn't match ask the user to reenter it .
+		 */
+		while(WrongPassFlag==0){
+			_delay_ms(300);
+			enterCurrentPass();//enter current password
+			sendCurrentPass();//send current password
+			if(checkCurrentPass()==PASS_CONFIRM){
+				/*if the password matches send command to change password */
+				WrongPassFlag=1;
+				while(UART_recieveByte()!=READY);
+				UART_sendByte(CHANGE_PASS);
+			}
+			else{
+				/*if pass don't match increment the wrongpasscount and enter pass again*/
+				wrongPassCount++;
+				if(wrongPassCount==3){
+					/*if the user enters wrong password 3 consecutive times
+					 * activate the alarm as done before.*/
+					WrongPassFlag=1;
+					while(UART_recieveByte()!=READY);
+					UART_sendByte(ALARM_ON);
+					LCD_clearScreen();
+					LCD_displayString("SYSTEM LOCKED!!!");
+					g_timercount=10;
+					Timer1_setCallBack(timer_delay);
+					Timer1_init(&timer_config);
+					while(g_timerFlag!=1);
+					g_timerFlag=0;
+
+				}
+			}
+		}
+		break;
+
+	}
+
+
+}
+
+
+
+
+/*************************************************************************
+ *                            MAIN FUNCTION                              *
+ *************************************************************************/
+
+int main(void){
+	LCD_init();/*initialize lcd*/
+
+	/*initialize uart with 8_bit ,no parity and 1 stop bit and bit rate 9600*/
+	UART_ConfigType uart_config={UART_8BIT,PARITY_DISABLE,UART_1_STOP_BIT,9600};
+	UART_init(&uart_config);
+	/*activate global interrupts for timer ISR*/
+	SREG|=(1<<7);
+	while(1){
+		/*check if there is a password stored in the system
+		 * if there is no password found then start the process to enter new password
+		 * if the is a password found then display the main options*/
+		if(checkIfPassExist()!=PASS_EXIST){
+			enterNewPassWithConfirm();
+		}
+		else {
+			displayMainOption();
+		}
+	}
+}

@@ -1,0 +1,166 @@
+/*
+ * Control_ECU_main.c
+ *
+ *  Created on: Oct 27, 2023
+ *      Author: Mark
+ */
+#include "buzzer.h"
+#include <util/delay.h>
+#include "uart.h"
+#include "external_eeprom.h"
+#include "my_lcd.h"
+#include "twi.h"
+#include "motor.h"
+#include "timer1.h"
+#include <avr/io.h>
+#define PASS_SIZE 5
+#define READY 0x0F
+#define PASS_EXIST 0xF7
+#define SEND_PASS 0x11
+#define PASS_CONFIRM 0x22
+#define SEND_CURRENT_PASS 0x33
+#define PASS_EXIST_ADDRESS 1
+#define CHECK_CURRENT_PASS 0X44
+#define OPEN_DOOR 0X55
+#define CHANGE_PASS 0X066
+
+
+char g_pass[5]={0};
+char g_passConfirm[5]={0};
+int g_passAddresses[5]={133,1056,2001,7,560};
+
+void deletePass(){
+	EEPROM_writeByte(PASS_EXIST_ADDRESS,0);
+	_delay_ms(10);
+}
+void openDoor(){
+	static char count =0;
+	count++;
+	if(count==5){
+		DcMotor_Rotate(MOTOR_STOP,0);
+	}
+	else if(count==8){
+		DcMotor_Rotate(MOTOR_ANTICLOCKWISE,50);
+
+	}
+	else if(count==13){
+		DcMotor_Rotate(MOTOR_STOP,0);
+		count=0;
+		Timer1_deInit();
+	}
+
+}
+uint8 passExists(void){
+	uint8 data;
+	EEPROM_readByte(PASS_EXIST_ADDRESS,&data);
+	if(data==PASS_EXIST){
+		for(char i=0;i<PASS_SIZE;i++){
+			EEPROM_readByte(g_passAddresses[i],&g_pass[i]);
+		}
+		return PASS_EXIST;
+	}
+	else
+		return 0;
+}
+void recievePass(){
+	for(char i=0;i<PASS_SIZE;i++){
+		g_pass[i]=UART_recieveByte();
+		//		LCD_integerToString(g_pass[i]);
+	}
+	//	UART_sendByte(READY);
+	for(char i=0;i<PASS_SIZE;i++){
+		g_passConfirm[i]=UART_recieveByte();
+		//		LCD_integerToString(g_pass[i]);
+	}
+}
+uint8 passConfirmMatch(){
+	UART_sendByte(READY);
+
+	uint8 flag=0;
+	for(char i=0;i<PASS_SIZE;i++){
+		if(g_pass[i]!=g_passConfirm[i]){
+			flag=1;
+			break;
+		}
+	}
+	if(flag==0){
+		//		UART_sendByte(READY);
+		UART_sendByte(PASS_CONFIRM);
+		return PASS_CONFIRM;
+	}
+	else{
+		//		UART_sendByte(READY);
+		UART_sendByte(0);
+		return 0;
+	}
+}
+void storePass(){
+	for(char i=0;i<PASS_SIZE;i++){
+		EEPROM_writeByte(g_passAddresses[i],g_pass[i]);
+		_delay_ms(10);
+	}
+	EEPROM_writeByte(PASS_EXIST_ADDRESS,PASS_EXIST);
+	_delay_ms(10);
+//	LCD_displayString("pass stored");
+//	uint8 data='c';
+//	EEPROM_readByte(PASS_EXIST_ADDRESS,&data);
+//	LCD_displayChar(data);
+}
+void recieveCurrentPass(){
+	for(char i=0;i<PASS_SIZE;i++){
+		g_passConfirm[(int)i]=UART_recieveByte();
+	}
+
+}
+uint8 currentPassConfirm(){
+	uint8 flag=0;
+	for(char i=0;i<PASS_SIZE;i++){
+		if(g_passConfirm[(int)i]!=g_pass[(int)i]){
+			flag=1;
+			break;
+		}
+	}
+	if(flag==0)
+		return PASS_CONFIRM;
+	else
+		return 0;
+}
+int main(void){
+	UART_ConfigType uart_config={UART_8BIT,PARITY_DISABLE,UART_1_STOP_BIT,9600};
+	TWI_ConfigType twi_config={10,FAST_MODE_400kbps};
+	UART_init(&uart_config);
+	TWI_init(&twi_config);
+	LCD_init();
+	DcMotor_init();
+	uint8 uartData;
+	SREG|=(1<<7);
+	while(1){
+		UART_sendByte(READY);
+		//		LCD_displayString("ready");
+		uartData=UART_recieveByte();
+		//		LCD_displayString("byte received");
+		if(uartData==PASS_EXIST){
+			UART_sendByte(passExists());
+		}
+		else if(uartData==SEND_PASS){
+			recievePass();
+			if(passConfirmMatch()==PASS_CONFIRM){
+				storePass();
+			}
+		}
+		else if(uartData==SEND_CURRENT_PASS){
+			recieveCurrentPass();
+		}
+		else if(uartData==CHECK_CURRENT_PASS){
+			UART_sendByte(currentPassConfirm());
+		}
+		else if(uartData==OPEN_DOOR){
+			DcMotor_Rotate(MOTOR_CLOCKWISE,50);
+			Timer1_ConfigType timer_config={0,15625,CLK_256,CTC_OCR1A};
+			Timer1_setCallBack(openDoor);
+			Timer1_init(&timer_config);
+		}
+
+	}
+}
+
